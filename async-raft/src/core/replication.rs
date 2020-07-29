@@ -25,23 +25,18 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
     #[tracing::instrument(level="trace", skip(self, target, is_line_rate))]
     async fn handle_rate_update(&mut self, target: NodeId, is_line_rate: bool) -> RaftResult<(), E> {
         // Get a handle the target's replication stat & update it as needed.
-        let repl_state = match self.nodes.get_mut(&target) {
-            Some(repl_state) => repl_state,
-            _ => return Ok(()),
-        };
-        repl_state.is_at_line_rate = is_line_rate;
-        // If in joint consensus, and the target node was one of the new nodes, update
-        // the joint consensus state to indicate that the target is up-to-date.
-        if let ConsensusState::Joint{new_nodes_being_synced, ..} = &mut self.consensus_state {
-            if let Some((idx, _)) = new_nodes_being_synced.iter().enumerate().find(|(_, e)| e == &&target) {
-                new_nodes_being_synced.remove(idx);
-            }
-            // If there are no remaining nodes to sync, then finalize this joint consensus.
-            if self.consensus_state.is_joint_consensus_safe_to_finalize() {
-                self.finalize_joint_consensus().await?;
+        if let Some(state) = self.nodes.get_mut(&target) {
+            state.is_at_line_rate = is_line_rate;
+            return Ok(());
+        }
+        // Else, if this is a non-voter, then update as needed.
+        if let Some(state) = self.new_nodes.get_mut(&target) {
+            state.state.is_at_line_rate = is_line_rate;
+            // If this node is now at line rate, and it has not yet been staged to join, then stage it.
+            if is_line_rate && !state.is_staged_to_join {
+                state.is_staged_to_join = true;
             }
         }
-
         Ok(())
     }
 
@@ -60,12 +55,18 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
     /// Handle events from a replication stream which updates the target node's match index.
     #[tracing::instrument(level="trace", skip(self, target, match_index))]
     async fn handle_update_match_index(&mut self, target: NodeId, match_index: u64) -> RaftResult<(), E> {
+        // If this is a non-voter, then update and return.
+        if let Some(state) = self.new_nodes.get_mut(&target) {
+            state.state.match_index = match_index;
+            return Ok(());
+        }
+
         // Update target's match index & check if it is awaiting removal.
         let mut needs_removal = false;
         match self.nodes.get_mut(&target) {
-            Some(replstate) => {
-                replstate.match_index = match_index;
-                if let Some(threshold) = &replstate.remove_after_commit {
+            Some(state) => {
+                state.match_index = match_index;
+                if let Some(threshold) = &state.remove_after_commit {
                     if &match_index >= threshold {
                         needs_removal = true;
                     }
@@ -96,6 +97,9 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
             // Update all replication streams based on new commit index.
             for node in self.nodes.values() {
                 let _ = node.replstream.repltx.send(RaftEvent::UpdateCommitIndex{commit_index: new_commit_index});
+            }
+            for node in self.new_nodes.values() {
+                let _ = node.state.replstream.repltx.send(RaftEvent::UpdateCommitIndex{commit_index: new_commit_index});
             }
 
             // Check if there are any pending requests which need to be processed.

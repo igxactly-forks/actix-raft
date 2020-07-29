@@ -8,7 +8,7 @@ mod install_snapshot;
 pub(crate) mod replication;
 mod vote;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,14 +21,11 @@ use tokio::time::{Instant, Duration, delay_until};
 use tracing_futures::Instrument;
 
 use crate::{AppData, AppDataResponse, AppError, RaftNetwork, RaftStorage, NodeId};
-use crate::error::{ClientError, InitWithConfigError, ProposeConfigChangeError, RaftResult};
 use crate::config::{Config, SnapshotPolicy};
-use crate::raft::MembershipConfig;
-use crate::metrics::{RaftMetrics, State};
 use crate::core::client::ClientRequestEntry;
-use crate::raft::{RxChanAppendEntries, RxChanVote, RxChanInstallSnapshot, RxChanClient, RxChanInit, RxChanPropose};
-use crate::raft::{ClientRequest, ClientResponse, InitWithConfig, ProposeConfigChange};
-use crate::raft::{TxClientResponse, TxInitResponse, TxProposeResponse};
+use crate::error::{ClientError, InitializeError, ChangeConfigError, RaftResult};
+use crate::metrics::{RaftMetrics, State};
+use crate::raft::{ClientRequest, ClientResponse, ClientResponseTx, RaftMsg, MembershipConfig};
 use crate::replication::{RaftEvent, ReplicationStream, ReplicaEvent};
 use crate::storage::HardState;
 
@@ -102,29 +99,19 @@ pub struct RaftCore<D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<
     tx_compaction: mpsc::Sender<SnapshotUpdate>,
     rx_compaction: mpsc::Receiver<SnapshotUpdate>,
 
-    rx_append_entries: RxChanAppendEntries<D, E>,
-    rx_vote: RxChanVote<E>,
-    rx_install_snapshot: RxChanInstallSnapshot<E>,
-    rx_client: RxChanClient<D, R, E>,
-    rx_init: RxChanInit<E>,
-    rx_propose: RxChanPropose<E>,
+    rx_api: mpsc::UnboundedReceiver<RaftMsg<D, R, E>>,
     tx_metrics: watch::Sender<RaftMetrics>,
 }
 
 impl<D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: RaftStorage<D, R, E>> RaftCore<D, R, E, N, S> {
     pub fn spawn(
         id: NodeId, config: Config, network: Arc<N>, storage: Arc<S>,
-        rx_append_entries: RxChanAppendEntries<D, E>,
-        rx_vote: RxChanVote<E>,
-        rx_install_snapshot: RxChanInstallSnapshot<E>,
-        rx_client: RxChanClient<D, R, E>,
-        rx_init: RxChanInit<E>,
-        rx_propose: RxChanPropose<E>,
+        rx_api: mpsc::UnboundedReceiver<RaftMsg<D, R, E>>,
         tx_metrics: watch::Sender<RaftMetrics>,
         needs_shutdown: Arc<AtomicBool>,
     ) -> JoinHandle<RaftResult<(), E>> {
         let config = Arc::new(config);
-        let membership = MembershipConfig{is_in_joint_consensus: false, members: vec![id], non_voters: vec![], removing: vec![]};
+        let membership = MembershipConfig::new_initial(id); // This is updated from storage in the main loop.
         let (tx_compaction, rx_compaction) = mpsc::channel(1);
         let this = Self{
             id, config, membership, network, storage,
@@ -133,9 +120,7 @@ impl<D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: RaftS
             last_log_index: 0, last_log_term: 0,
             snapshot_state: None, snapshot_index: 0,
             last_heartbeat: None, next_election_timeout: None,
-            tx_compaction, rx_compaction,
-            rx_append_entries, rx_vote, rx_install_snapshot, rx_client,
-            rx_init, rx_propose, tx_metrics,
+            tx_compaction, rx_compaction, rx_api, tx_metrics,
             needs_shutdown,
         };
         tokio::spawn(this.main())
@@ -217,7 +202,7 @@ impl<D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: RaftS
     /// Update core's target state, ensuring all invariants are upheld.
     #[tracing::instrument(level="debug", skip(self))]
     fn set_target_state(&mut self, target_state: TargetState) {
-        if &target_state == &TargetState::Follower && self.membership.non_voters.contains(&self.id) {
+        if &target_state == &TargetState::Follower && !self.membership.contains(&self.id) {
             self.target_state = TargetState::NonVoter;
         }
         self.target_state = target_state;
@@ -355,19 +340,19 @@ impl<D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: RaftS
 
     /// Reject an init config request due to the Raft node being in a state which prohibits the request.
     #[tracing::instrument(level="trace", skip(self, tx))]
-    fn reject_init_with_config(&self, _: InitWithConfig, tx: TxInitResponse<E>) {
-        let _ = tx.send(Err(InitWithConfigError::NotAllowed));
+    fn reject_init_with_config(&self, tx: oneshot::Sender<Result<(), InitializeError<E>>>) {
+        let _ = tx.send(Err(InitializeError::NotAllowed));
     }
 
     /// Reject a proposed config change request due to the Raft node being in a state which prohibits the request.
     #[tracing::instrument(level="trace", skip(self, tx))]
-    fn reject_propose_config_change(&self, _: ProposeConfigChange, tx: TxProposeResponse<E>) {
-        let _ = tx.send(Err(ProposeConfigChangeError::NodeNotLeader));
+    fn reject_config_change_not_leader(&self, tx: oneshot::Sender<Result<(), ChangeConfigError<E>>>) {
+        let _ = tx.send(Err(ChangeConfigError::NodeNotLeader));
     }
 
     /// Forward the given client request to the leader.
     #[tracing::instrument(level="trace", skip(self, req, tx))]
-    fn forward_client_request(&self, req: ClientRequest<D>, tx: TxClientResponse<D, R, E>) {
+    fn forward_client_request(&self, req: ClientRequest<D>, tx: ClientResponseTx<D, R, E>) {
         let _ = tx.send(Err(ClientError::ForwardToLeader(req, self.voted_for.clone())));
     }
 }
@@ -456,6 +441,11 @@ struct LeaderState<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwo
     pub(super) core: &'a mut RaftCore<D, R, E, N, S>,
     /// A mapping of node IDs the replication state of the target node.
     pub(super) nodes: BTreeMap<NodeId, ReplicationState<D>>,
+    /// A mapping of new nodes (non-voters) which are being synced in order to join the cluster.
+    pub(super) new_nodes: BTreeMap<NodeId, NonVoterReplicationState<D, E>>,
+    /// The set of nodes which have been requested for removal from the cluster.
+    pub(super) nodes_to_remove: HashSet<NodeId>,
+
     /// The stream of events coming from replication streams.
     pub(super) replicationrx: mpsc::UnboundedReceiver<ReplicaEvent<S::Snapshot>>,
     /// The clonable sender channel for replication stream events.
@@ -464,6 +454,7 @@ struct LeaderState<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwo
     pub(super) awaiting_committed: Vec<ClientRequestEntry<D, R, E>>,
     /// A field tracking the cluster's current consensus state, which is used for dynamic membership.
     pub(super) consensus_state: ConsensusState,
+
     /// An optional response channel for when a config change has been proposed, and is awaiting a response.
     pub(super) propose_config_change_cb: Option<oneshot::Sender<Result<(), ClientError<D, E>>>>,
     /// An optional receiver for when a joint consensus config is committed.
@@ -475,19 +466,16 @@ struct LeaderState<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwo
 impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: RaftStorage<D, R, E>> LeaderState<'a, D, R, E, N, S> {
     /// Create a new instance.
     pub(self) fn new(core: &'a mut RaftCore<D, R, E, N, S>) -> Self {
-        let consensus_state = if core.membership.is_in_joint_consensus {
-            ConsensusState::Joint{
-                new_nodes_being_synced: core.membership.non_voters.clone(),
-                is_committed: false,
-            }
+        let consensus_state = if core.membership.is_in_joint_consensus() {
+            ConsensusState::Joint{is_committed: false}
         } else {
             ConsensusState::Uniform
         };
         let (replicationtx, replicationrx) = mpsc::unbounded_channel();
         Self{
-            core, nodes: BTreeMap::new(), awaiting_committed: Vec::new(), consensus_state,
-            propose_config_change_cb: None, joint_consensus_cb: FuturesOrdered::new(), uniform_consensus_cb: FuturesOrdered::new(),
-            replicationtx, replicationrx,
+            core, nodes: BTreeMap::new(), new_nodes: BTreeMap::new(), nodes_to_remove: HashSet::new(), awaiting_committed: Vec::new(),
+            consensus_state, propose_config_change_cb: None, joint_consensus_cb: FuturesOrdered::new(),
+            uniform_consensus_cb: FuturesOrdered::new(), replicationtx, replicationrx,
         }
     }
 
@@ -495,9 +483,8 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
     #[tracing::instrument(level="debug", skip(self), fields(id=self.core.id, raft_state="leader"))]
     pub(self) async fn run(mut self) -> RaftResult<(), E> {
         // Spawn replication streams.
-        let targets = self.core.membership.members.iter()
+        let targets = self.core.membership.all_nodes()
             .filter(|elem| *elem != &self.core.id)
-            .chain(self.core.membership.non_voters.iter())
             .collect::<Vec<_>>();
         for target in targets {
             // Build & spawn a replication stream for the target member.
@@ -527,31 +514,30 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
                 return Ok(());
             }
             tokio::select!{
-                Some((rpc, tx)) = self.core.rx_append_entries.next() => {
-                    let res = self.core.handle_append_entries_request(rpc).await;
-                    let _ = tx.send(res);
-                }
-                Some((rpc, tx)) = self.core.rx_vote.next() => {
-                    let res = self.core.handle_vote_request(rpc).await;
-                    let _ = tx.send(res);
-                }
-                Some((rpc, tx)) = self.core.rx_install_snapshot.next() => {
-                    let res = self.core.handle_install_snapshot_request(rpc).await;
-                    let _ = tx.send(res);
-                }
+                Some(msg) = self.core.rx_api.next() => match msg {
+                    RaftMsg::AppendEntries{rpc, tx} => {
+                        let _ = tx.send(self.core.handle_append_entries_request(rpc).await);
+                    }
+                    RaftMsg::RequestVote{rpc, tx} => {
+                        let _ = tx.send(self.core.handle_vote_request(rpc).await);
+                    }
+                    RaftMsg::InstallSnapshot{rpc, tx} => {
+                        let _ = tx.send(self.core.handle_install_snapshot_request(rpc).await);
+                    }
+                    RaftMsg::ClientRequest{rpc, tx} => {
+                        self.handle_client_request(rpc, tx).await;
+                    }
+                    RaftMsg::Initialize{tx, ..} => {
+                        self.core.reject_init_with_config(tx);
+                    }
+                    RaftMsg::AddNonVoter{..} => {
+                        todo!("TODO:");
+                    }
+                    RaftMsg::ChangeMembership{..} => {
+                        todo!("TODO:");
+                    }
+                },
                 Some(update) = self.core.rx_compaction.next() => self.core.update_snapshot_state(update),
-                Some((rpc, tx)) = self.core.rx_client.next() => self.handle_client_request(rpc, tx).await,
-                Some((rpc, tx)) = self.core.rx_init.next() => self.core.reject_init_with_config(rpc, tx),
-                Some((rpc, tx)) = self.core.rx_propose.next() => {
-                    let res = match self.handle_propose_config_change(rpc).await {
-                        Ok(res) => match res.await {
-                            Ok(_) => Ok(()),
-                            Err(err) => Err(err),
-                        }
-                        Err(err) => Err(err),
-                    };
-                    let _ = tx.send(res);
-                }
                 Some(Ok(res)) = self.joint_consensus_cb.next() => {
                     match res {
                         Ok(clientres) => self.handle_joint_consensus_committed(clientres).await?,
@@ -587,14 +573,23 @@ struct ReplicationState<D: AppData> {
     pub replstream: ReplicationStream<D>,
 }
 
+/// The same as `ReplicationState`, except for non-voters.
+struct NonVoterReplicationState<D: AppData, E: AppError> {
+    /// The replication stream state.
+    state: ReplicationState<D>,
+    /// A bool indicating if this node has been staged to join the cluster.
+    is_staged_to_join: bool,
+    /// The response channel to use for when this node has successfully joined the cluster.
+    tx: oneshot::Sender<Result<(), ChangeConfigError<E>>>,
+}
+
+/// A state enum used by Raft leaders to navigate the joint consensus protocol.
 pub enum ConsensusState {
     /// The cluster consensus is uniform; not in a joint consensus state.
     Uniform,
     /// The cluster is in a joint consensus state and is syncing new nodes.
     Joint {
-        /// The new nodes which are being synced.
-        new_nodes_being_synced: Vec<NodeId>,
-        /// A bool indicating if the associated config which started this join consensus has yet been comitted.
+        /// A bool indicating if the associated config which started this joint consensus has yet been comitted.
         ///
         /// NOTE: when a new leader is elected, it will initialize this value to false, and then
         /// update this value to true once the new leader's blank payload has been committed.
@@ -608,11 +603,9 @@ impl ConsensusState {
     /// The return value will be true if:
     /// 1. this object currently represents a joint consensus state.
     /// 2. the corresponding config for this consensus state has been committed to the cluster.
-    /// 3. all new nodes being added to the cluster have been synced.
     pub fn is_joint_consensus_safe_to_finalize(&self) -> bool {
         match self {
-            ConsensusState::Joint{is_committed, new_nodes_being_synced}
-                if *is_committed && new_nodes_being_synced.len() == 0 => true,
+            ConsensusState::Joint{is_committed} => *is_committed,
             _ => false,
         }
     }
@@ -653,7 +646,7 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
             self.core.report_metrics(State::Candidate);
 
             // Send RPCs to all members in parallel.
-            let mut pending_votes = self.spawn_parallel_vote_requests();
+            let mut pending_votes = self.spawn_parallel_vote_requests(); // TODO: update this to account for joint consensus.
 
             // Inner processing loop for this Raft state.
             loop {
@@ -664,23 +657,31 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
                 let mut timeout_fut = delay_until(self.core.get_next_election_timeout());
                 tokio::select!{
                     _ = &mut timeout_fut => break, // This election has timed-out. Break to outer loop, which starts a new term.
-                    Some((rpc, tx)) = self.core.rx_append_entries.next() => {
-                        let res = self.core.handle_append_entries_request(rpc).await;
-                        let _ = tx.send(res);
-                    }
-                    Some((rpc, tx)) = self.core.rx_vote.next() => {
-                        let res = self.core.handle_vote_request(rpc).await;
-                        let _ = tx.send(res);
-                    }
-                    Some((rpc, tx)) = self.core.rx_install_snapshot.next() => {
-                        let res = self.core.handle_install_snapshot_request(rpc).await;
-                        let _ = tx.send(res);
-                    }
-                    Some((rpc, tx)) = self.core.rx_client.next() => self.core.forward_client_request(rpc, tx),
-                    Some((rpc, tx)) = self.core.rx_init.next() => self.core.reject_init_with_config(rpc, tx),
-                    Some((rpc, tx)) = self.core.rx_propose.next() => self.core.reject_propose_config_change(rpc, tx),
-                    Some(update) = self.core.rx_compaction.next() => self.core.update_snapshot_state(update),
                     Some((res, peer)) = pending_votes.recv() => self.handle_vote_response(res, peer).await?,
+                    Some(msg) = self.core.rx_api.next() => match msg {
+                        RaftMsg::AppendEntries{rpc, tx} => {
+                            let _ = tx.send(self.core.handle_append_entries_request(rpc).await);
+                        }
+                        RaftMsg::RequestVote{rpc, tx} => {
+                            let _ = tx.send(self.core.handle_vote_request(rpc).await);
+                        }
+                        RaftMsg::InstallSnapshot{rpc, tx} => {
+                            let _ = tx.send(self.core.handle_install_snapshot_request(rpc).await);
+                        }
+                        RaftMsg::ClientRequest{rpc, tx} => {
+                            self.core.forward_client_request(rpc, tx);
+                        }
+                        RaftMsg::Initialize{tx, ..} => {
+                            self.core.reject_init_with_config(tx);
+                        }
+                        RaftMsg::AddNonVoter{tx, ..} => {
+                            self.core.reject_config_change_not_leader(tx);
+                        }
+                        RaftMsg::ChangeMembership{tx, ..} => {
+                            self.core.reject_config_change_not_leader(tx);
+                        }
+                    },
+                    Some(update) = self.core.rx_compaction.next() => self.core.update_snapshot_state(update),
                 }
             }
         }
@@ -713,22 +714,30 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
             tokio::select!{
                 // If an election timeout is hit, then we need to transition to candidate.
                 _ = &mut election_timeout => self.core.set_target_state(TargetState::Candidate),
-                Some((rpc, tx)) = self.core.rx_append_entries.next() => {
-                    let res = self.core.handle_append_entries_request(rpc).await;
-                    let _ = tx.send(res);
-                }
-                Some((rpc, tx)) = self.core.rx_vote.next() => {
-                    let res = self.core.handle_vote_request(rpc).await;
-                    let _ = tx.send(res);
-                }
-                Some((rpc, tx)) = self.core.rx_install_snapshot.next() => {
-                    let res = self.core.handle_install_snapshot_request(rpc).await;
-                    let _ = tx.send(res);
-                }
+                Some(msg) = self.core.rx_api.next() => match msg {
+                    RaftMsg::AppendEntries{rpc, tx} => {
+                        let _ = tx.send(self.core.handle_append_entries_request(rpc).await);
+                    }
+                    RaftMsg::RequestVote{rpc, tx} => {
+                        let _ = tx.send(self.core.handle_vote_request(rpc).await);
+                    }
+                    RaftMsg::InstallSnapshot{rpc, tx} => {
+                        let _ = tx.send(self.core.handle_install_snapshot_request(rpc).await);
+                    }
+                    RaftMsg::ClientRequest{rpc, tx} => {
+                        self.core.forward_client_request(rpc, tx);
+                    }
+                    RaftMsg::Initialize{tx, ..} => {
+                        self.core.reject_init_with_config(tx);
+                    }
+                    RaftMsg::AddNonVoter{tx, ..} => {
+                        self.core.reject_config_change_not_leader(tx);
+                    }
+                    RaftMsg::ChangeMembership{tx, ..} => {
+                        self.core.reject_config_change_not_leader(tx);
+                    }
+                },
                 Some(update) = self.core.rx_compaction.next() => self.core.update_snapshot_state(update),
-                Some((rpc, tx)) = self.core.rx_client.next() => self.core.forward_client_request(rpc, tx),
-                Some((rpc, tx)) = self.core.rx_init.next() => self.core.reject_init_with_config(rpc, tx),
-                Some((rpc, tx)) = self.core.rx_propose.next() => self.core.reject_propose_config_change(rpc, tx),
             }
         }
     }
@@ -756,25 +765,30 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
                 return Ok(());
             }
             tokio::select!{
-                Some((rpc, tx)) = self.core.rx_append_entries.next() => {
-                    let res = self.core.handle_append_entries_request(rpc).await;
-                    let _ = tx.send(res);
-                }
-                Some((rpc, tx)) = self.core.rx_vote.next() => {
-                    let res = self.core.handle_vote_request(rpc).await;
-                    let _ = tx.send(res);
-                }
-                Some((rpc, tx)) = self.core.rx_install_snapshot.next() => {
-                    let res = self.core.handle_install_snapshot_request(rpc).await;
-                    let _ = tx.send(res);
-                }
+                Some(msg) = self.core.rx_api.next() => match msg {
+                    RaftMsg::AppendEntries{rpc, tx} => {
+                        let _ = tx.send(self.core.handle_append_entries_request(rpc).await);
+                    }
+                    RaftMsg::RequestVote{rpc, tx} => {
+                        let _ = tx.send(self.core.handle_vote_request(rpc).await);
+                    }
+                    RaftMsg::InstallSnapshot{rpc, tx} => {
+                        let _ = tx.send(self.core.handle_install_snapshot_request(rpc).await);
+                    }
+                    RaftMsg::ClientRequest{rpc, tx} => {
+                        self.core.forward_client_request(rpc, tx);
+                    }
+                    RaftMsg::Initialize{members, tx} => {
+                        let _ = tx.send(self.handle_init_with_config(members).await);
+                    }
+                    RaftMsg::AddNonVoter{tx, ..} => {
+                        self.core.reject_config_change_not_leader(tx);
+                    }
+                    RaftMsg::ChangeMembership{tx, ..} => {
+                        self.core.reject_config_change_not_leader(tx);
+                    }
+                },
                 Some(update) = self.core.rx_compaction.next() => self.core.update_snapshot_state(update),
-                Some((rpc, tx)) = self.core.rx_client.next() => self.core.forward_client_request(rpc, tx),
-                Some((rpc, tx)) = self.core.rx_init.next() => {
-                    let res = self.handle_init_with_config(rpc).await;
-                    let _ = tx.send(res);
-                }
-                Some((rpc, tx)) = self.core.rx_propose.next() => self.core.reject_propose_config_change(rpc, tx),
             }
         }
     }

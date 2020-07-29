@@ -5,8 +5,7 @@ use tokio::sync::oneshot;
 use crate::{AppData, AppDataResponse, AppError, RaftNetwork, RaftStorage};
 use crate::core::LeaderState;
 use crate::error::{ClientError, RaftError, RaftResult};
-use crate::raft::TxClientResponse;
-use crate::raft::{ClientRequest, ClientResponse, Entry, EntryPayload, ResponseMode};
+use crate::raft::{ClientRequest, ClientResponse, ClientResponseTx, Entry, EntryPayload, ResponseMode};
 use crate::replication::RaftEvent;
 
 /// A wrapper around a ClientRequest which has been transformed into an Entry, along with its ResponseMode & channel.
@@ -19,12 +18,12 @@ pub(super) struct ClientRequestEntry<D: AppData, R: AppDataResponse, E: AppError
     /// The response mode of the request.
     pub response_mode: ResponseMode,
     /// The response channel for the request.
-    pub tx: TxClientResponse<D, R, E>,
+    pub tx: ClientResponseTx<D, R, E>,
 }
 
 impl<D: AppData, R: AppDataResponse, E: AppError> ClientRequestEntry<D, R, E> {
     /// Create a new instance from the raw components of a client request.
-    pub(crate) fn from_entry(entry: Entry<D>, response_mode: ResponseMode, tx: TxClientResponse<D, R, E>) -> Self {
+    pub(crate) fn from_entry(entry: Entry<D>, response_mode: ResponseMode, tx: ClientResponseTx<D, R, E>) -> Self {
         Self{entry: Arc::new(entry), response_mode, tx}
     }
 }
@@ -51,7 +50,8 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
                 // Find the most recent config change.
                 .iter().rev()
                 .filter_map(|entry| match &entry.payload {
-                    EntryPayload::ConfigChange(cfg) => Some(cfg.membership.is_in_joint_consensus),
+                    EntryPayload::ConfigChange(cfg) => Some(cfg.membership.is_in_joint_consensus()),
+                    EntryPayload::SnapshotPointer(cfg) => Some(cfg.membership.is_in_joint_consensus()),
                     _ => None,
                 })
                 .nth(0);
@@ -77,7 +77,7 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
 
     /// Handle client requests.
     #[tracing::instrument(level="trace", skip(self, rpc, tx))]
-    pub(super) async fn handle_client_request(&mut self, rpc: ClientRequest<D>, tx: TxClientResponse<D, R, E>) {
+    pub(super) async fn handle_client_request(&mut self, rpc: ClientRequest<D>, tx: ClientResponseTx<D, R, E>) {
         let entry = match self.append_payload_to_log(rpc.entry).await {
             Ok(entry) => ClientRequestEntry::from_entry(entry, rpc.response_mode, tx),
             Err(err) => {
@@ -106,8 +106,8 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
     pub(super) async fn replicate_client_request(&mut self, req: ClientRequestEntry<D, R, E>) {
         // Replicate the request if there are other cluster members. The client response will be
         // returned elsewhere after the entry has been committed to the cluster.
-        if self.nodes.len() > 0 {
-            let entry_arc = req.entry.clone();
+        let entry_arc = req.entry.clone();
+        if !self.nodes.is_empty() {
             self.awaiting_committed.push(req);
             for node in self.nodes.values() {
                 let _ = node.replstream.repltx.send(RaftEvent::Replicate{
@@ -115,12 +115,21 @@ impl<'a, D: AppData, R: AppDataResponse, E: AppError, N: RaftNetwork<D, E>, S: R
                     commit_index: self.core.commit_index,
                 });
             }
-            return;
+        } else {
+            // Else, there are no voting nodes for replication, so the payload is now committed.
+            self.core.commit_index = entry_arc.index;
+            self.client_request_post_commit(req).await;
         }
 
-        // Else, there are no nodes for replication, so the payload is now committed.
-        self.core.commit_index = req.entry.index;
-        self.client_request_post_commit(req).await;
+        // Replicate to non-voters.
+        if !self.new_nodes.is_empty() {
+            for node in self.new_nodes.values() {
+                let _ = node.state.replstream.repltx.send(RaftEvent::Replicate{
+                    entry: entry_arc.clone(),
+                    commit_index: self.core.commit_index,
+                });
+            }
+        }
     }
 
     /// Handle the post-commit logic for a client request.
